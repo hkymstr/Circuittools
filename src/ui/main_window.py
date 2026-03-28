@@ -413,6 +413,7 @@ class MainWindow(QMainWindow):
     def _on_compare_changed(self, lap_numbers: list[int]) -> None:
         self._track_map_panel.set_compare_laps(lap_numbers)
         self._channel_panel.set_compare_laps(lap_numbers)
+        self._video_panel.set_compare_laps(lap_numbers)
 
     def _on_finish_line_set(self, lat: float, lon: float) -> None:
         if self._session is None:
