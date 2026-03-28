@@ -109,27 +109,39 @@ def find_box(fp: BinaryIO, path: list[str], start: int = 0, end: int | None = No
 # ---------------------------------------------------------------------------
 # AIM Smartycam3 data track format
 # ---------------------------------------------------------------------------
-# AIM embeds a binary data stream. The format as reverse-engineered from
-# Smartycam3 firmware and community analysis:
+# The Smartycam3 stores video (H.264) AND all telemetry (GPS, 3-axis
+# accelerometer, CAN/ECU channels) together in a single .mp4 file written to
+# the MicroSD card.  Race Studio 3 extracts the channels from this file.
 #
-#   Header (per-frame record, little-endian):
+# The telemetry is in a dedicated binary track inside the MP4 container.
+# Format as reverse-engineered from community analysis (little-endian):
+#
+#   Per-sample record (assumed layout — run diagnostic tool to verify):
 #     uint32  timestamp_ms
 #     int32   latitude  * 1e7 (degrees)
 #     int32   longitude * 1e7 (degrees)
 #     int16   speed_kmh * 10
 #     int16   heading   * 10 (degrees)
 #     int16   altitude_m * 10
-#     int16   accel_x   * 1000 (G)
-#     int16   accel_y   * 1000 (G)
-#     int16   accel_z   * 1000 (G)
+#     int16   accel_x   * 1000 (G, longitudinal)
+#     int16   accel_y   * 1000 (G, lateral)
+#     int16   accel_z   * 1000 (G, vertical)
+#     uint16  rpm
+#     uint8   gear        (0 = neutral)
+#     uint8   throttle_%  (0–100)
+#     uint8   brake_%     (0–100)
 #     uint8   satellites
-#     uint8   fix_type   (0=no fix, 1=2D, 2=3D)
+#     uint8   fix_type    (0=no fix, 1=2D, 2=3D)
+#     uint8   _reserved
 #
-# Total = 26 bytes per record.
+# Total = 30 bytes per record.
 #
-# Note: if the sample file reveals a different layout, update _AIM_RECORD_FMT.
+# IMPORTANT: run the diagnostic CLI to check the actual atom tree before
+# assuming this layout is correct for your firmware version:
+#   python -m src.data.parsers.mp4_parser /path/to/file.mp4
+# Then update _AIM_RECORD_FMT and _parse_aim_binary() accordingly.
 
-_AIM_RECORD_FMT = "<IiihhhhhhBB"  # 26 bytes
+_AIM_RECORD_FMT = "<IiihhhhhhHBBBBBB"  # 30 bytes
 _AIM_RECORD_SIZE = struct.calcsize(_AIM_RECORD_FMT)
 
 _AIM_TRACK_FOURCCS = {"aim1", "aim2", "AIM1", "AIM2", "smcy", "SMCY"}
@@ -248,45 +260,59 @@ class Mp4Parser(BaseParser):
 
     def _parse_aim_binary(self, data: bytes, session: Session) -> None:
         """Decode AIM binary telemetry into session channels."""
+        from ...data.session import CH_RPM, CH_GEAR, CH_THROTTLE, CH_BRAKE
         n = len(data) // _AIM_RECORD_SIZE
         if n == 0:
             return
 
         timestamps = np.empty(n)
-        lats = np.empty(n)
-        lons = np.empty(n)
-        speeds = np.empty(n)
-        headings = np.empty(n)
+        lats      = np.empty(n)
+        lons      = np.empty(n)
+        speeds    = np.empty(n)
+        headings  = np.empty(n)
         altitudes = np.empty(n)
-        ax = np.empty(n)
-        ay = np.empty(n)
-        az = np.empty(n)
+        ax        = np.empty(n)
+        ay        = np.empty(n)
+        az        = np.empty(n)
+        rpm       = np.empty(n)
+        gear      = np.empty(n)
+        throttle  = np.empty(n)
+        brake     = np.empty(n)
 
         for i in range(n):
             offset = i * _AIM_RECORD_SIZE
-            ts, lat, lon, spd, hdg, alt, ax_, ay_, az_, *_ = struct.unpack_from(
-                _AIM_RECORD_FMT, data, offset
-            )
+            (ts, lat, lon, spd, hdg, alt,
+             ax_, ay_, az_,
+             rpm_, gear_, thr_, brk_,
+             *_rest) = struct.unpack_from(_AIM_RECORD_FMT, data, offset)
             timestamps[i] = ts / 1000.0
-            lats[i] = lat / 1e7
-            lons[i] = lon / 1e7
-            speeds[i] = spd / 10.0
-            headings[i] = hdg / 10.0
-            altitudes[i] = alt / 10.0
-            ax[i] = ax_ / 1000.0
-            ay[i] = ay_ / 1000.0
-            az[i] = az_ / 1000.0
+            lats[i]       = lat / 1e7
+            lons[i]       = lon / 1e7
+            speeds[i]     = spd / 10.0
+            headings[i]   = hdg / 10.0
+            altitudes[i]  = alt / 10.0
+            ax[i]         = ax_  / 1000.0
+            ay[i]         = ay_  / 1000.0
+            az[i]         = az_  / 1000.0
+            rpm[i]        = float(rpm_)
+            gear[i]       = float(gear_)
+            throttle[i]   = float(thr_)
+            brake[i]      = float(brk_)
 
         t0 = timestamps[0]
-        session.channels[CH_TIME] = timestamps - t0
-        session.channels[CH_LAT] = lats
-        session.channels[CH_LON] = lons
-        session.channels[CH_SPEED] = speeds
-        session.channels[CH_HEADING] = headings
-        session.channels[CH_HEIGHT] = altitudes
-        session.channels[CH_AX] = ax
-        session.channels[CH_AY] = ay
-        session.channels[CH_AZ] = az
+        session.channels[CH_TIME]     = timestamps - t0
+        session.channels[CH_LAT]      = lats
+        session.channels[CH_LON]      = lons
+        session.channels[CH_SPEED]    = speeds
+        session.channels[CH_HEADING]  = headings
+        session.channels[CH_HEIGHT]   = altitudes
+        session.channels[CH_AX]       = ax
+        session.channels[CH_AY]       = ay
+        session.channels[CH_AZ]       = az
+        session.channels[CH_RPM]      = rpm
+        session.channels[CH_GEAR]     = gear
+        session.channels[CH_THROTTLE] = throttle
+        session.channels[CH_BRAKE]    = brake
         session.metadata["telemetry"] = "AIM"
 
     # ------------------------------------------------------------------

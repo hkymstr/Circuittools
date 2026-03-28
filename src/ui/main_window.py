@@ -296,9 +296,9 @@ class MainWindow(QMainWindow):
             "Open Data / Video File",
             "",
             "Supported files (*.mp4 *.vbo *.csv *.txt);;"
-            "MP4 video (*.mp4);;"
+            "Smartycam3 MP4 — video + telemetry (*.mp4);;"
             "VBOX files (*.vbo);;"
-            "CSV files (*.csv *.txt);;"
+            "Race Studio 3 CSV export (*.csv *.txt);;"
             "All files (*.*)",
         )
         if not path:

@@ -15,9 +15,14 @@ playback timeline.
 **Primary supported formats**
 | File type | Extension | Notes |
 |-----------|-----------|-------|
-| AIM Smartycam3 video + embedded telemetry | `.mp4` | Telemetry parsed from MP4 metadata track |
+| AIM Smartycam3 video + embedded telemetry | `.mp4` | **Single file contains both H.264 video and all telemetry channels** (GPS, 3-axis accel, CAN/ECU data). Written directly to the MicroSD card. |
 | VBOX data logger | `.vbo` | Text-based, Racelogic format |
 | Race Studio 3 CSV export | `.csv` / `.txt` | AIM export from Race Studio 3 software |
+
+> **Smartycam3 `.mp4` workflow:** Drop the `.mp4` from the SD card directly into File → Open.
+> The app loads video playback and all telemetry from the same file.  No separate data file needed.
+> If the embedded telemetry track format differs from the assumed layout, run the diagnostic tool
+> (see §7) to inspect the actual MP4 atom tree.
 
 ---
 
