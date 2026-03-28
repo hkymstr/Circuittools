@@ -21,8 +21,8 @@ Layout (mirrors Vbox Circuit Tools):
 from __future__ import annotations
 
 import os
-from PyQt6.QtCore import Qt, QSize
-from PyQt6.QtGui import QAction, QIcon, QKeySequence
+from PyQt6.QtCore import Qt, QSize, QUrl
+from PyQt6.QtGui import QAction, QIcon, QKeySequence, QDragEnterEvent, QDropEvent
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QDockWidget, QVBoxLayout, QHBoxLayout,
     QSplitter, QLabel, QPushButton, QSlider, QComboBox,
@@ -48,6 +48,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(self.APP_TITLE)
         self.resize(1600, 900)
         self.setMinimumSize(QSize(900, 600))
+        self.setAcceptDrops(True)
 
         self._playback = PlaybackController(self)
         self._session: Session | None = None
@@ -62,12 +63,66 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _build_ui(self) -> None:
-        # Central widget: video (top) + channels (bottom)
-        central = QWidget()
-        self.setCentralWidget(central)
-        central_layout = QVBoxLayout(central)
-        central_layout.setContentsMargins(0, 0, 0, 0)
-        central_layout.setSpacing(0)
+        # Central widget: welcome screen OR analysis layout
+        self._central_stack = QWidget()
+        self.setCentralWidget(self._central_stack)
+        stack_layout = QVBoxLayout(self._central_stack)
+        stack_layout.setContentsMargins(0, 0, 0, 0)
+        stack_layout.setSpacing(0)
+
+        # Welcome / drop-zone screen (shown until a file is loaded)
+        self._welcome = QWidget()
+        self._welcome.setStyleSheet("background: #111111;")
+        wl = QVBoxLayout(self._welcome)
+        wl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        wl.setSpacing(16)
+
+        title = QLabel("Circuit Tools")
+        title.setStyleSheet(
+            "font-size: 28px; font-weight: bold; color: #00c040; "
+            "font-family: 'Segoe UI', Arial, sans-serif;"
+        )
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        wl.addWidget(title)
+
+        subtitle = QLabel("AIM Smartycam3 Track Analyser")
+        subtitle.setStyleSheet("font-size: 13px; color: #606060;")
+        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        wl.addWidget(subtitle)
+
+        wl.addSpacing(20)
+
+        drop_hint = QLabel("Drop your Smartycam3 .mp4 file here")
+        drop_hint.setStyleSheet(
+            "font-size: 15px; color: #505050; padding: 30px 60px; "
+            "border: 2px dashed #333333; border-radius: 8px;"
+        )
+        drop_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        wl.addWidget(drop_hint)
+
+        wl.addSpacing(16)
+
+        open_btn = QPushButton("Open MP4 File…")
+        open_btn.setFixedSize(200, 44)
+        open_btn.setStyleSheet(
+            "font-size: 14px; font-weight: bold; "
+            "background: #00c040; color: #000; border: none; border-radius: 6px;"
+        )
+        open_btn.clicked.connect(self.open_data_file)
+        wl.addWidget(open_btn, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        also_label = QLabel("Also supports .vbo (VBOX) and .csv (Race Studio 3 export)")
+        also_label.setStyleSheet("font-size: 10px; color: #404040;")
+        also_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        wl.addWidget(also_label)
+
+        stack_layout.addWidget(self._welcome)
+
+        # Analysis layout (hidden until file loaded)
+        self._analysis = QWidget()
+        analysis_layout = QVBoxLayout(self._analysis)
+        analysis_layout.setContentsMargins(0, 0, 0, 0)
+        analysis_layout.setSpacing(0)
 
         # Splitter: video top, channels bottom
         self._central_splitter = QSplitter(Qt.Orientation.Vertical)
@@ -79,10 +134,13 @@ class MainWindow(QMainWindow):
         self._central_splitter.addWidget(self._video_panel)
         self._central_splitter.addWidget(self._channel_panel)
         self._central_splitter.setSizes([420, 280])
-        central_layout.addWidget(self._central_splitter)
+        analysis_layout.addWidget(self._central_splitter)
 
         # Playback bar
-        central_layout.addWidget(self._build_playback_bar())
+        analysis_layout.addWidget(self._build_playback_bar())
+
+        stack_layout.addWidget(self._analysis)
+        self._analysis.hide()
 
         # Dock: lap panel (left)
         self._lap_panel = LapPanel(self._playback)
@@ -196,12 +254,14 @@ class MainWindow(QMainWindow):
         # File
         file_menu = menubar.addMenu("&File")
 
-        open_act = QAction("&Open Data File…", self)
+        open_act = QAction("&Open File…", self)
         open_act.setShortcut(QKeySequence.StandardKey.Open)
         open_act.triggered.connect(self.open_data_file)
         file_menu.addAction(open_act)
 
-        open_video_act = QAction("Open &Video File…", self)
+        # Separate video attachment only needed when loading a .vbo / .csv
+        # (Smartycam3 .mp4 already contains both video and data)
+        open_video_act = QAction("Attach &Video to Session…", self)
         open_video_act.setShortcut("Ctrl+Shift+O")
         open_video_act.triggered.connect(self.open_video_file)
         file_menu.addAction(open_video_act)
@@ -308,8 +368,11 @@ class MainWindow(QMainWindow):
     def open_video_file(self) -> None:
         if self._session is None:
             QMessageBox.information(
-                self, "No Session",
-                "Load a data file first, then attach a video."
+                self, "Attach Video",
+                "For Smartycam3: just use File → Open File and select your .mp4 — "
+                "it contains both video and data in one file.\n\n"
+                "'Attach Video' is only needed when you loaded a separate .vbo or .csv "
+                "data file and want to link a video to it."
             )
             return
         path, _ = QFileDialog.getOpenFileName(
@@ -345,11 +408,14 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _on_session_loaded(self, session: Session) -> None:
+        # Switch from welcome screen to analysis layout
+        self._welcome.hide()
+        self._analysis.show()
+
         duration = session.duration
         self._total_label.setText(self._format_time(duration))
         self._btn_play.setText("▶")
         laps = len(session.laps)
-        tel = session.metadata.get("telemetry", "?")
         self._status_label.setText(
             f"Loaded  |  Duration: {self._format_time(duration)}"
             f"  |  Samples: {session.sample_count}"
@@ -451,6 +517,27 @@ class MainWindow(QMainWindow):
         minutes = int(t // 60)
         seconds = t % 60
         return f"{minutes}:{seconds:06.3f}"
+
+    # ------------------------------------------------------------------
+    # Keyboard shortcuts
+    # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Drag-and-drop
+    # ------------------------------------------------------------------
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        if event.mimeData().hasUrls():
+            urls = event.mimeData().urls()
+            if urls and urls[0].toLocalFile().lower().endswith(
+                (".mp4", ".vbo", ".csv", ".txt")
+            ):
+                event.acceptProposedAction()
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        urls = event.mimeData().urls()
+        if urls:
+            self._load_file(urls[0].toLocalFile())
 
     # ------------------------------------------------------------------
     # Keyboard shortcuts
