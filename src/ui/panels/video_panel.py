@@ -257,10 +257,16 @@ class _VideoPane(QWidget):
     def enable_audio(self, on: bool) -> None:
         self._audio.setVolume(0.7 if on else 0.0)
 
-    def seek(self, session_time: float, video_offset: float) -> None:
-        """Seek the player to the absolute session time."""
-        ms = int(max(0.0, session_time + video_offset) * 1000)
-        self._player.setPosition(ms)
+    def seek(self, session_time: float, video_offset: float, force: bool = False) -> None:
+        """
+        Seek the player to the absolute session time.
+        When the player is actively playing, skip the seek — repeatedly calling
+        setPosition() while playing fights the player's own clock and stalls it.
+        Only seek when paused or when force=True (e.g. user scrubbed the slider).
+        """
+        if force or self._player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+            ms = int(max(0.0, session_time + video_offset) * 1000)
+            self._player.setPosition(ms)
 
     def update_overlay(self, session_time: float) -> None:
         self._overlay.update_time(session_time)
@@ -291,9 +297,21 @@ class VideoPanel(QWidget):
 
     def set_playing(self, playing: bool) -> None:
         """Called by PlaybackController when play/pause state changes."""
+        if self._session is None:
+            return
+        offset = self._session.video_offset
+        t = self._playback.current_time
+
         if playing:
+            # Sync video to current data position before starting playback
+            self._left.seek(t, offset, force=True)
             self._left._player.play()
-            if self._right.isVisible():
+            if self._right.isVisible() and self._right._lap is not None:
+                ref_lap = self._left._lap
+                comp_lap = self._right._lap
+                elapsed = (t - ref_lap.start_time) if ref_lap else 0.0
+                comp_t = comp_lap.start_time + elapsed
+                self._right.seek(comp_t, offset, force=True)
                 self._right._player.play()
         else:
             self._left._player.pause()
