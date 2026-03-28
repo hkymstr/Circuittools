@@ -286,6 +286,15 @@ class ChannelPanel(QWidget):
         for plot in self._plots.values():
             plot.clear_compare_data()
 
+        # Remove any existing Delta-T plot
+        if "__delta_t__" in self._plots:
+            old = self._plots.pop("__delta_t__")
+            self._plot_layout.removeWidget(old)
+            old.deleteLater()
+
+        if not lap_numbers or len(lap_numbers) < 1:
+            return
+
         for i, lap_num in enumerate(lap_numbers[:4]):
             lap = next(
                 (l for l in self._session.laps if l.number == lap_num), None
@@ -303,9 +312,54 @@ class ChannelPanel(QWidget):
                 if data is not None:
                     plot.set_compare_data(i, t_relative, data)
 
+        # Add Delta-T plot when exactly two laps are compared
+        if len(lap_numbers) >= 2 and self._session.best_lap:
+            self._add_delta_t_plot(lap_numbers[0], lap_numbers[1])
+
     # ------------------------------------------------------------------
     # Time / lap events
     # ------------------------------------------------------------------
+
+    def _add_delta_t_plot(self, ref_lap_num: int, comp_lap_num: int) -> None:
+        """Insert a Delta-T plot at the top of the channel stack."""
+        from ...data.delta import compute_delta_t
+        session = self._session
+        if session is None:
+            return
+        ref_lap  = next((l for l in session.laps if l.number == ref_lap_num),  None)
+        comp_lap = next((l for l in session.laps if l.number == comp_lap_num), None)
+        if ref_lap is None or comp_lap is None:
+            return
+        try:
+            _dist, delta_t = compute_delta_t(session, ref_lap, comp_lap)
+        except Exception:
+            return
+
+        # Use the comparison lap's time axis (relative)
+        comp_ch = session.lap_channels(comp_lap)
+        t = comp_ch[CH_TIME] - comp_ch[CH_TIME][0]
+
+        # Delta-T plot — blue, centred on zero, fixed ±5 s range
+        plot = _ChannelPlot(
+            "__delta_t__", "Δ Time", "s",
+            pen_colour=ACCENT_BLUE, pen_width=1.5,
+        )
+        plot.setYRange(-5, 5, padding=0.05)
+        # Zero reference line
+        zero_line = pg.InfiniteLine(
+            angle=0, movable=False,
+            pen=pg.mkPen("#505050", width=1, style=pg.QtCore.Qt.PenStyle.DashLine),
+        )
+        plot.addItem(zero_line)
+        plot.set_data(t, delta_t)
+        plot.seek_requested.connect(self._playback.seek)
+
+        if self._link_x_axis is not None:
+            plot.getViewBox().setXLink(self._link_x_axis)
+
+        # Insert at position 0 (top of stack)
+        self._plot_layout.insertWidget(0, plot)
+        self._plots["__delta_t__"] = plot
 
     def _on_time_changed(self, t: float) -> None:
         for plot in self._plots.values():

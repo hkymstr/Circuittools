@@ -8,8 +8,9 @@ from ..session import Session
 from .csv_parser import CsvParser
 from .vbo_parser import VboParser
 from .mp4_parser import Mp4Parser
+from .xrk_parser import XrkParser
 
-_PARSERS = [Mp4Parser(), VboParser(), CsvParser()]
+_PARSERS = [Mp4Parser(), VboParser(), XrkParser(), CsvParser()]
 
 
 def load_file(path: str) -> Session:
@@ -25,7 +26,8 @@ def load_file(path: str) -> Session:
 
     raise ValueError(
         f"Unsupported file type: {os.path.splitext(path)[1]}\n"
-        "Supported formats: .mp4, .vbo, .csv, .txt"
+        "Supported formats: .mp4 (Smartycam3), .vbo (VBOX), "
+        ".xrk/.drk (AIM logger — CSV export recommended), .csv, .txt"
     )
 
 

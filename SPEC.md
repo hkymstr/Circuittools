@@ -104,7 +104,47 @@ lap.lap_time:   float  # computed property
 lap.lap_time_str: str  # e.g. "1:23.456"
 ```
 
-### 3.3 Adding a New Parser
+### 3.3 AIM Device Variants and GPS Source
+
+| Variant | Built-in GPS | External GPS | Data format |
+|---------|-------------|--------------|-------------|
+| Smartycam 3 **Sport** | No | AIM GPS09 module via CAN | `.mp4` |
+| Smartycam 3 **Dual** | Yes | Optional GPS09 upgrade | `.mp4` |
+| Smartycam 3 **GP** | Yes | Optional GPS09 upgrade | `.mp4` |
+
+> If your Sport has no GPS09 module connected, the `.mp4` will have video and
+> accelerometer data only (no lat/lon/speed).  In that case, pair it with a
+> Solo 2 DL logger (which produces a `.xrk` file) and load the CSV export.
+
+**AIM logger formats:**
+
+| Extension | Description |
+|-----------|-------------|
+| `.mp4` | Smartycam3 output — video + embedded telemetry (primary format) |
+| `.xrk` | AIM native logger format (Solo 2 DL, MX-Series, EVO5, etc.) — binary |
+| `.drk` | Older AIM format (Race Studio 2 era) — binary |
+
+`.xrk`/`.drk` parsing on Linux/macOS requires a CSV export from Race Studio 3
+(see `src/data/parsers/xrk_parser.py` for details on adding full DLL support).
+
+### 3.4 Delta-T Channel (`src/data/delta.py`)
+
+Delta-T is the time gain/loss of a comparison lap vs a reference lap,
+evaluated at each position around the circuit.  It is the key analysis
+channel in Circuit Tools and Race Studio 3.
+
+```python
+from src.data.delta import compute_delta_t, compute_all_delta_t
+
+dist, delta_t = compute_delta_t(session, reference_lap, comparison_lap)
+# dist     — cumulative distance array (metres)
+# delta_t  — seconds; negative = comparison is ahead (faster)
+```
+
+The channel panel adds a Delta-T plot automatically when the user selects
+exactly two laps for comparison in the lap list.
+
+### 3.5 Adding a New Parser
 
 1. Create `src/data/parsers/my_format_parser.py`.
 2. Subclass `BaseParser` and implement `can_parse(path)` and `parse(path)`.
@@ -114,7 +154,7 @@ lap.lap_time_str: str  # e.g. "1:23.456"
 ```python
 # loader.py
 from .my_format_parser import MyFormatParser
-_PARSERS = [Mp4Parser(), VboParser(), CsvParser(), MyFormatParser()]
+_PARSERS = [Mp4Parser(), VboParser(), XrkParser(), CsvParser(), MyFormatParser()]
 ```
 
 ---
@@ -280,14 +320,16 @@ Current assumed layout (little-endian, 26 bytes per sample):
 
 ## 9. Planned / Suggested Features
 
-- [ ] **Sector timing** — divide each lap into sectors via multiple finish-line clicks
+- [ ] **Sector timing** — divide each lap into sectors via multiple finish-line clicks; colour each sector green/red vs reference
+- [ ] **Ideal Lap** — compute the theoretically fastest lap by combining the best sector from each lap in the session
 - [ ] **Export lap times** — CSV export of the lap table
 - [ ] **Video offset persistence** — save `video_offset` to a sidecar `.json` file
-- [ ] **Sector map colouring** — colour track segments by sector delta
+- [ ] **Satellite map background** — overlay GPS track on Google/Bing Maps tile (like Circuit Tools 3 and Race Studio 3)
 - [ ] **Live telemetry** — connect to Smartycam3 over WiFi for real-time data
 - [ ] **G-G diagram** — scatter plot of lateral vs longitudinal G
 - [ ] **Channel maths** — define derived channels (e.g., combined G magnitude)
-- [ ] **Dark/light theme toggle**
+- [ ] **Histogram / Reports view** — per-channel distribution across laps (like Circuit Tools Reports pane)
+- [ ] **Full .xrk parser** — xdrk DLL integration (Windows) or community binary parser
 - [ ] **Session notes** — freeform text note per session
 
 ---
