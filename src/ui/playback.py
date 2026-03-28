@@ -65,7 +65,11 @@ class PlaybackController(QObject):
             lap = self._get_lap(self._active_lap)
             if lap:
                 return lap.lap_time
-        return self._session.duration
+        d = self._session.duration
+        # If no telemetry channels, use the stored video duration fallback
+        if d == 0.0:
+            return self._session.metadata.get("_video_duration_s", 0.0)  # type: ignore
+        return d
 
     @property
     def time_offset(self) -> float:
@@ -127,13 +131,18 @@ class PlaybackController(QObject):
         self._rate = rate
 
     def step_frame(self, direction: int = 1) -> None:
-        """Advance or rewind by one data sample."""
+        """Advance or rewind by one data sample (or 1/30 s if no data channels)."""
         if self._session is None:
             return
-        t = self._current_time
-        idx = self._session.idx_at_time(t) + direction
-        idx = max(0, min(idx, self._session.sample_count - 1))
-        self.seek(float(self._session.time[idx]))
+        from ..data.session import CH_TIME
+        if CH_TIME in self._session.channels and self._session.sample_count > 0:
+            t = self._current_time
+            idx = self._session.idx_at_time(t) + direction
+            idx = max(0, min(idx, self._session.sample_count - 1))
+            self.seek(float(self._session.time[idx]))
+        else:
+            # No telemetry — step by one video frame (~1/30 s)
+            self.seek(max(0.0, self._current_time + direction * (1.0 / 30.0)))
 
     # ------------------------------------------------------------------
     # Lap management

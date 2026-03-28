@@ -217,16 +217,28 @@ class _VideoPane(QWidget):
         self._overlay.set_session(session)
 
         if session.has_video():
+            # Disconnect any previous status handler before setting new source
+            try:
+                self._player.mediaStatusChanged.disconnect(self._on_media_loaded)
+            except RuntimeError:
+                pass
+            self._player.mediaStatusChanged.connect(self._on_media_loaded)
             self._player.setSource(QUrl.fromLocalFile(session.video_path))
-            # Must call pause() after setSource() so the player moves from
-            # StoppedState → PausedState, which allows setPosition() to work
-            # and renders the first frame in the video widget.
-            self._player.pause()
             self._video_widget.show()
             self._placeholder.hide()
         else:
             self._video_widget.hide()
             self._placeholder.show()
+
+    def _on_media_loaded(self, status) -> None:
+        """Pause once media is buffered so the first frame is visible."""
+        if status == QMediaPlayer.MediaStatus.LoadedMedia or \
+           status == QMediaPlayer.MediaStatus.BufferedMedia:
+            self._player.pause()
+            try:
+                self._player.mediaStatusChanged.disconnect(self._on_media_loaded)
+            except RuntimeError:
+                pass
 
         if lap:
             self._lap_label.setText(
@@ -297,21 +309,9 @@ class VideoPanel(QWidget):
 
     def set_playing(self, playing: bool) -> None:
         """Called by PlaybackController when play/pause state changes."""
-        if self._session is None:
-            return
-        offset = self._session.video_offset
-        t = self._playback.current_time
-
         if playing:
-            # Sync video to current data position before starting playback
-            self._left.seek(t, offset, force=True)
             self._left._player.play()
-            if self._right.isVisible() and self._right._lap is not None:
-                ref_lap = self._left._lap
-                comp_lap = self._right._lap
-                elapsed = (t - ref_lap.start_time) if ref_lap else 0.0
-                comp_t = comp_lap.start_time + elapsed
-                self._right.seek(comp_t, offset, force=True)
+            if self._right.isVisible():
                 self._right._player.play()
         else:
             self._left._player.pause()
