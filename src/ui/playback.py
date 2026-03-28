@@ -17,6 +17,7 @@ from ..data.session import Session, Lap
 class PlaybackController(QObject):
 
     time_changed = pyqtSignal(float)
+    play_state_changed = pyqtSignal(bool)  # True = playing, False = paused
     session_loaded = pyqtSignal(object)    # Session
     laps_updated = pyqtSignal()
     lap_selected = pyqtSignal(int)
@@ -97,10 +98,12 @@ class PlaybackController(QObject):
             return
         self._playing = True
         self._timer.start()
+        self.play_state_changed.emit(True)
 
     def pause(self) -> None:
         self._playing = False
         self._timer.stop()
+        self.play_state_changed.emit(False)
 
     def toggle_play(self) -> None:
         if self._playing:

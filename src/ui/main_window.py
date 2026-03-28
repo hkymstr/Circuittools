@@ -330,6 +330,7 @@ class MainWindow(QMainWindow):
         pb.session_loaded.connect(self._on_session_loaded)
         pb.time_changed.connect(self._on_time_changed)
         pb.laps_updated.connect(self._on_laps_updated)
+        pb.play_state_changed.connect(self._video_panel.set_playing)
 
         self._btn_play.clicked.connect(pb.toggle_play)
         self._btn_to_start.clicked.connect(lambda: pb.seek(0.0))

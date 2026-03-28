@@ -218,6 +218,10 @@ class _VideoPane(QWidget):
 
         if session.has_video():
             self._player.setSource(QUrl.fromLocalFile(session.video_path))
+            # Must call pause() after setSource() so the player moves from
+            # StoppedState → PausedState, which allows setPosition() to work
+            # and renders the first frame in the video widget.
+            self._player.pause()
             self._video_widget.show()
             self._placeholder.hide()
         else:
@@ -284,6 +288,17 @@ class VideoPanel(QWidget):
         self._build_ui()
         playback.session_loaded.connect(self._on_session_loaded)
         playback.time_changed.connect(self._on_time_changed)
+
+    def set_playing(self, playing: bool) -> None:
+        """Called by PlaybackController when play/pause state changes."""
+        if playing:
+            self._left._player.play()
+            if self._right.isVisible():
+                self._right._player.play()
+        else:
+            self._left._player.pause()
+            if self._right.isVisible():
+                self._right._player.pause()
 
     # ------------------------------------------------------------------
     # UI construction
