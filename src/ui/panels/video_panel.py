@@ -198,13 +198,15 @@ class _VideoPane(QWidget):
         frame_layout.addWidget(self._placeholder)
         self._video_widget.hide()
 
-        # Media player
+        # Media player — setVideoOutput is deferred to load() so the widget
+        # has a valid native window handle before the backend attaches to it.
         self._player = QMediaPlayer()
         self._audio  = QAudioOutput()
         self._player.setAudioOutput(self._audio)
-        self._player.setVideoOutput(self._video_widget)
         self._audio.setVolume(0.0)   # muted by default; main pane enables audio
         self._player.errorOccurred.connect(self._on_player_error)
+        self._player.mediaStatusChanged.connect(self._on_status_debug)
+        self._player.playbackStateChanged.connect(self._on_state_debug)
 
     # ------------------------------------------------------------------
 
@@ -218,15 +220,19 @@ class _VideoPane(QWidget):
         self._overlay.set_session(session)
 
         if session.has_video():
+            # Show widget first so it has a valid native window handle,
+            # then attach the player output and set the source.
+            self._video_widget.show()
+            self._placeholder.hide()
+            self._player.setVideoOutput(self._video_widget)
             # Disconnect any previous status handler before setting new source
             try:
                 self._player.mediaStatusChanged.disconnect(self._on_media_loaded)
             except RuntimeError:
                 pass
             self._player.mediaStatusChanged.connect(self._on_media_loaded)
+            print(f"[VideoPane] loading: {session.video_path}")
             self._player.setSource(QUrl.fromLocalFile(session.video_path))
-            self._video_widget.show()
-            self._placeholder.hide()
         else:
             self._video_widget.hide()
             self._placeholder.show()
@@ -239,8 +245,10 @@ class _VideoPane(QWidget):
                 self._player.mediaStatusChanged.disconnect(self._on_media_loaded)
             except RuntimeError:
                 pass
-            # Pause to display the first frame (only if not already playing)
-            if self._player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+            # To render the first frame the player must enter Playing state
+            # briefly; pause() on a Stopped player renders nothing on most backends.
+            if self._player.playbackState() == QMediaPlayer.PlaybackState.StoppedState:
+                self._player.play()
                 self._player.pause()
             lap = self._lap
             session = self._session
@@ -250,7 +258,13 @@ class _VideoPane(QWidget):
                 self._lap_label.setText(os.path.basename(session.source_file or ""))
 
     def _on_player_error(self, error, error_string: str) -> None:
-        print(f"[VideoPane] player error {error}: {error_string}")
+        print(f"[VideoPane] ERROR {error}: {error_string}")
+
+    def _on_status_debug(self, status) -> None:
+        print(f"[VideoPane] status → {status.name}")
+
+    def _on_state_debug(self, state) -> None:
+        print(f"[VideoPane] state  → {state.name}")
 
     def unload(self) -> None:
         self._player.setSource(QUrl())
