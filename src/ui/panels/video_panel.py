@@ -204,6 +204,7 @@ class _VideoPane(QWidget):
         self._player.setAudioOutput(self._audio)
         self._player.setVideoOutput(self._video_widget)
         self._audio.setVolume(0.0)   # muted by default; main pane enables audio
+        self._player.errorOccurred.connect(self._on_player_error)
 
     # ------------------------------------------------------------------
 
@@ -231,21 +232,25 @@ class _VideoPane(QWidget):
             self._placeholder.show()
 
     def _on_media_loaded(self, status) -> None:
-        """Pause once media is buffered so the first frame is visible."""
+        """Show first frame once media is buffered; update lap label."""
         if status == QMediaPlayer.MediaStatus.LoadedMedia or \
            status == QMediaPlayer.MediaStatus.BufferedMedia:
-            self._player.pause()
             try:
                 self._player.mediaStatusChanged.disconnect(self._on_media_loaded)
             except RuntimeError:
                 pass
+            # Pause to display the first frame (only if not already playing)
+            if self._player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+                self._player.pause()
+            lap = self._lap
+            session = self._session
+            if lap is not None:
+                self._lap_label.setText(f"Lap {lap.number}  —  {lap.lap_time_str}")
+            elif session is not None:
+                self._lap_label.setText(os.path.basename(session.source_file or ""))
 
-        if lap:
-            self._lap_label.setText(
-                f"Lap {lap.number}  —  {lap.lap_time_str}"
-            )
-        else:
-            self._lap_label.setText(os.path.basename(session.source_file or ""))
+    def _on_player_error(self, error, error_string: str) -> None:
+        print(f"[VideoPane] player error {error}: {error_string}")
 
     def unload(self) -> None:
         self._player.setSource(QUrl())
