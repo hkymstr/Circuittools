@@ -228,7 +228,7 @@ class _VideoPane(QWidget):
             # Disconnect any previous status handler before setting new source
             try:
                 self._player.mediaStatusChanged.disconnect(self._on_media_loaded)
-            except RuntimeError:
+            except (RuntimeError, TypeError):
                 pass
             self._player.mediaStatusChanged.connect(self._on_media_loaded)
             print(f"[VideoPane] loading: {session.video_path}")
@@ -243,7 +243,7 @@ class _VideoPane(QWidget):
            status == QMediaPlayer.MediaStatus.BufferedMedia:
             try:
                 self._player.mediaStatusChanged.disconnect(self._on_media_loaded)
-            except RuntimeError:
+            except (RuntimeError, TypeError):
                 pass
             # To render the first frame the player must enter Playing state
             # briefly; pause() on a Stopped player renders nothing on most backends.

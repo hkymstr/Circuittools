@@ -476,58 +476,63 @@ class Mp4Parser(BaseParser):
             ch_ts[ch].append(ts)
             ch_val[ch].append(val)
 
-        def arr(ch: int | None) -> np.ndarray | None:
-            if ch is None or ch not in ch_val:
-                return None
-            return np.array(ch_val[ch], dtype=np.float64)
-
-        # --- Master time axis from the session-timer channel ---
+        # --- Master time axis: use the session-timer channel's record TIMESTAMPS
+        #     as the common interpolation grid so every channel ends up the same length.
         time_ch = assignments.get("time")
-        if time_ch is not None and time_ch in ch_val:
-            t_arr = np.array(ch_val[time_ch], dtype=np.float64)
+        if time_ch is not None and time_ch in ch_ts:
+            t_ms_grid = np.array(ch_ts[time_ch], dtype=np.float64)
+            t_arr     = np.array(ch_val[time_ch], dtype=np.float64)
         else:
-            # Fall back: derive time from record timestamps
-            # Use the speed channel's timestamps if available
             speed_ch = assignments.get("speed")
             ref_ch   = speed_ch if speed_ch is not None else next(iter(ch_ts), None)
             if ref_ch is None:
                 return
-            ts_ms = np.array(ch_ts[ref_ch], dtype=np.float64)
-            t_arr = (ts_ms - ts_ms[0]) / 1000.0
+            t_ms_grid = np.array(ch_ts[ref_ch], dtype=np.float64)
+            t_arr     = (t_ms_grid - t_ms_grid[0]) / 1000.0
 
         if len(t_arr) == 0:
             return
         session.channels[CH_TIME] = t_arr
 
-        # --- GPS (lat/lon inserted later by bare-record scanner if found) ---
+        def arr_interp(ch_id: int | None) -> np.ndarray | None:
+            """Interpolate channel ch_id onto t_ms_grid so it matches CH_TIME length."""
+            if ch_id is None or ch_id not in ch_val:
+                return None
+            src_ts  = np.array(ch_ts[ch_id],  dtype=np.float64)
+            src_val = np.array(ch_val[ch_id], dtype=np.float64)
+            if len(src_ts) < 2:
+                return None
+            return np.interp(t_ms_grid, src_ts, src_val)
+
+        # --- GPS (lat/lon inserted later by _inject_gps_blocks) ---
 
         # --- Speed ---
-        spd = arr(assignments.get("speed"))
+        spd = arr_interp(assignments.get("speed"))
         if spd is not None:
             session.channels[CH_SPEED] = spd
 
         # --- Altitude  (feet → metres) ---
-        alt = arr(assignments.get("alt"))
+        alt = arr_interp(assignments.get("alt"))
         if alt is not None:
             session.channels[CH_HEIGHT] = alt * 0.3048  # ft → m
 
         # --- RPM ---
-        rpm = arr(assignments.get("rpm"))
+        rpm = arr_interp(assignments.get("rpm"))
         if rpm is not None:
             session.channels[CH_RPM] = rpm
 
         # --- Gear ---
-        gear = arr(assignments.get("gear"))
+        gear = arr_interp(assignments.get("gear"))
         if gear is not None:
             session.channels[CH_GEAR] = gear
 
         # --- Throttle ---
-        thr = arr(assignments.get("throttle"))
+        thr = arr_interp(assignments.get("throttle"))
         if thr is not None:
             session.channels[CH_THROTTLE] = thr
 
-        # --- Brake (scale 0–66 → 0–100 %) ---
-        brk = arr(assignments.get("brake"))
+        # --- Brake (scale 0–brk_max → 0–100 %) ---
+        brk = arr_interp(assignments.get("brake"))
         if brk is not None:
             brk_max = ch_stats.get(assignments["brake"], {}).get("max", 100.0) or 100.0
             session.channels[CH_BRAKE] = np.clip(brk / brk_max * 100.0, 0, 100)
@@ -584,10 +589,19 @@ class Mp4Parser(BaseParser):
         lons: list[float],
         session: Session,
     ) -> None:
-        """Add GPS lat/lon arrays to the session if both lists are non-empty."""
-        if lats and lons:
+        """Add GPS lat/lon arrays resampled to match CH_TIME length."""
+        if not lats or not lons:
+            return
+        n_target = len(session.channels.get(CH_TIME, []))
+        if n_target == 0 or len(lats) == n_target:
             session.channels[CH_LAT] = np.array(lats, dtype=np.float64)
             session.channels[CH_LON] = np.array(lons, dtype=np.float64)
+        else:
+            # GPS blocks are sampled at a different rate; resample to telemetry grid
+            src = np.linspace(0.0, 1.0, len(lats))
+            tgt = np.linspace(0.0, 1.0, n_target)
+            session.channels[CH_LAT] = np.interp(tgt, src, lats)
+            session.channels[CH_LON] = np.interp(tgt, src, lons)
 
     # ------------------------------------------------------------------
     # GoPro GPMD fallback
