@@ -177,15 +177,16 @@ class Mp4Parser(BaseParser):
 
         assignments, ch_stats = self._auto_assign_channels(records)
 
-        lat_ch   = assignments.get("lat")
-        lon_ch   = assignments.get("lon")
-        speed_ch = assignments.get("speed")
-        alt_ch   = assignments.get("alt")
-
-        if lat_ch is None and lon_ch is None:
+        # Need at least time or speed to be useful
+        if assignments.get("time") is None and assignments.get("speed") is None:
             return False
 
         self._build_session(records, assignments, ch_stats, session)
+
+        # Try to recover GPS lat/lon from bare records in <hGPS> blocks
+        bare = self._parse_aim_bare_gps(raw_data)
+        self._inject_bare_gps(bare, session)
+
         return True
 
     def _find_aim_meta_track(
@@ -338,11 +339,19 @@ class Mp4Parser(BaseParser):
         records: list[tuple[int, int, float]],
     ) -> tuple[dict[str, int | None], dict[int, dict]]:
         """
-        Analyse value distributions per channel_id and return a mapping
-        { 'lat', 'lon', 'speed', 'alt' } → channel_id (or None).
+        Identify semantic channels from value-range statistics.
 
-        Also returns per-channel stats dicts with keys:
-            min, max, mean, ptp, n
+        Confirmed channel IDs from SCHD1246.MP4 analysis:
+          23 = session_time (seconds, 0–769)
+          42 = RPM  (669–7339)
+          43 = GPS speed km/h  (0–217)
+          44 = gear  (0–7)
+          51 = throttle %  (6–90)
+           3 = altitude ft  (1159–1166)
+          58 = brake (0–66)
+          60 = lateral accel m/s²  (−14 to +37, mean≈0)
+        GPS lat/lon are stored in bare records inside <hGPS> blocks
+        (not in (S…) records) — see _parse_aim_bare_gps().
         """
         ch_vals: dict[int, list[float]] = defaultdict(list)
         for _, ch, val in records:
@@ -361,89 +370,89 @@ class Mp4Parser(BaseParser):
 
         used: set[int] = set()
 
-        # --- Latitude / Longitude ---
-        # Position channels are "stable": ptp < 2 ° (a circuit rarely spans > 0.1 °)
-        # and values within ±90 (lat) or ±180 (lon).
-        pos_cands = [
-            (ch, s)
-            for ch, s in ch_stats.items()
-            if 0 < s["ptp"] < 2.0 and -180 <= s["min"] and s["max"] <= 180
-        ]
-        # Sort by ptp ascending (most stable first)
-        pos_cands.sort(key=lambda x: x[1]["ptp"])
+        def _pick(cands: list[tuple[int, dict]], key_fn) -> int | None:
+            if not cands:
+                return None
+            ch = key_fn(cands)
+            used.add(ch)
+            return ch
 
+        # --- Session time ---
+        # Monotonically increasing channel: largest ptp, min≈0, max > 60 s
+        time_cands = [
+            (ch, s) for ch, s in ch_stats.items()
+            if s["min"] >= 0 and s["max"] > 60 and s["ptp"] > 60
+        ]
+        time_ch = _pick(time_cands, lambda c: max(c, key=lambda x: x[1]["ptp"])[0])
+
+        # --- Speed km/h ---
+        # ptp > 50, max ≤ 400, min = 0
+        speed_cands = [
+            (ch, s) for ch, s in ch_stats.items()
+            if ch not in used
+            and s["min"] >= 0 and s["max"] <= 400 and s["ptp"] > 50
+        ]
+        speed_ch = _pick(speed_cands, lambda c: max(c, key=lambda x: x[1]["max"])[0])
+
+        # --- RPM ---
+        # max > 2000, ptp > 2000
+        rpm_cands = [
+            (ch, s) for ch, s in ch_stats.items()
+            if ch not in used and s["max"] > 2000 and s["ptp"] > 2000
+        ]
+        rpm_ch = _pick(rpm_cands, lambda c: max(c, key=lambda x: x[1]["max"])[0])
+
+        # --- Gear ---
+        # max ≤ 10, ptp ≤ 10, min = 0
+        gear_cands = [
+            (ch, s) for ch, s in ch_stats.items()
+            if ch not in used
+            and s["min"] >= 0 and s["max"] <= 10 and s["ptp"] <= 10
+        ]
+        gear_ch = _pick(gear_cands, lambda c: max(c, key=lambda x: x[1]["ptp"])[0])
+
+        # --- Throttle % ---
+        # min ≥ 0, max ≤ 105, ptp > 30, mean < 70
+        throttle_cands = [
+            (ch, s) for ch, s in ch_stats.items()
+            if ch not in used
+            and s["min"] >= 0 and s["max"] <= 105 and s["ptp"] > 30 and s["mean"] < 70
+        ]
+        throttle_ch = _pick(throttle_cands, lambda c: max(c, key=lambda x: x[1]["ptp"])[0])
+
+        # --- Brake ---
+        # min ≥ 0, max ≤ 200, ptp > 10, mean < 50, not already used
+        brake_cands = [
+            (ch, s) for ch, s in ch_stats.items()
+            if ch not in used
+            and s["min"] >= 0 and s["max"] <= 200 and s["ptp"] > 10 and s["mean"] < 50
+        ]
+        brake_ch = _pick(brake_cands, lambda c: max(c, key=lambda x: x[1]["ptp"])[0])
+
+        # --- Altitude (feet or metres) ---
+        # Positive, small ptp relative to mean (stable over session), mean > 100
+        alt_cands = [
+            (ch, s) for ch, s in ch_stats.items()
+            if ch not in used
+            and s["min"] > 0 and s["ptp"] < 0.2 * s["mean"] and s["mean"] > 100
+        ]
+        alt_ch = _pick(alt_cands, lambda c: min(c, key=lambda x: x[1]["ptp"])[0])
+
+        # GPS lat/lon: NOT present in (S…) records for this firmware.
+        # They appear in <hGPS> bare records; handled by _parse_aim_bare_gps().
         lat_ch: int | None = None
         lon_ch: int | None = None
 
-        if len(pos_cands) >= 2:
-            # Disambiguate lat vs lon:
-            # • For N-hemisphere European/Asian/American tracks:
-            #   lat ∈ [20, 80], lon varies widely.
-            # • If both positive: the one with larger absolute mean is latitude
-            #   (lat > lon for most Europe/Asia venues; N. Am. lon is negative).
-            # • If one is negative (western hemisphere lon): that's lon.
-            a_ch, a_s = pos_cands[0]
-            b_ch, b_s = pos_cands[1]
-            a_mean, b_mean = a_s["mean"], b_s["mean"]
-
-            if a_mean >= 0 and b_mean < 0:
-                # b is negative → western-hemisphere longitude
-                lat_ch, lon_ch = a_ch, b_ch
-            elif a_mean < 0 and b_mean >= 0:
-                lat_ch, lon_ch = b_ch, a_ch
-            else:
-                # Both same sign: larger absolute mean → latitude
-                if abs(a_mean) >= abs(b_mean):
-                    lat_ch, lon_ch = a_ch, b_ch
-                else:
-                    lat_ch, lon_ch = b_ch, a_ch
-
-        elif len(pos_cands) == 1:
-            # Only one position-like channel; assume it's latitude if plausible
-            ch, s = pos_cands[0]
-            if -90 <= s["mean"] <= 90:
-                lat_ch = ch
-
-        if lat_ch is not None:
-            used.add(lat_ch)
-        if lon_ch is not None:
-            used.add(lon_ch)
-
-        # --- Speed ---
-        # Values in [0, 400] km/h, clearly varying (ptp > 5), mean > 2
-        speed_cands = [
-            (ch, s)
-            for ch, s in ch_stats.items()
-            if ch not in used
-            and s["min"] >= 0 and s["max"] <= 400
-            and s["ptp"] > 5 and s["mean"] > 2
-        ]
-        speed_ch: int | None = None
-        if speed_cands:
-            # Prefer the channel whose max is highest (GPS ground speed, not vertical)
-            speed_ch = max(speed_cands, key=lambda x: x[1]["max"])[0]
-            used.add(speed_ch)
-
-        # --- Altitude ---
-        # Positive values, ptp < 3 000, mean > 0, not already used
-        alt_cands = [
-            (ch, s)
-            for ch, s in ch_stats.items()
-            if ch not in used
-            and s["min"] >= 0 and s["max"] <= 10_000
-            and 0 < s["ptp"] < 3_000 and s["mean"] > 0
-        ]
-        alt_ch: int | None = None
-        if alt_cands:
-            # Prefer the channel whose mean is closest to 300 m (typical circuit altitude)
-            alt_ch = min(alt_cands, key=lambda x: abs(x[1]["mean"] - 300))[0]
-            used.add(alt_ch)
-
         assignments: dict[str, int | None] = {
-            "lat":   lat_ch,
-            "lon":   lon_ch,
-            "speed": speed_ch,
-            "alt":   alt_ch,
+            "time":     time_ch,
+            "lat":      lat_ch,
+            "lon":      lon_ch,
+            "speed":    speed_ch,
+            "rpm":      rpm_ch,
+            "gear":     gear_ch,
+            "throttle": throttle_ch,
+            "brake":    brake_ch,
+            "alt":      alt_ch,
         }
         return assignments, ch_stats
 
@@ -458,65 +467,165 @@ class Mp4Parser(BaseParser):
         ch_stats: dict[int, dict],
         session: Session,
     ) -> None:
-        lat_ch   = assignments.get("lat")
-        lon_ch   = assignments.get("lon")
-        speed_ch = assignments.get("speed")
-        alt_ch   = assignments.get("alt")
+        from ..session import CH_RPM, CH_GEAR, CH_THROTTLE, CH_BRAKE
 
-        # Collect per-channel time-series
+        # Collect per-channel time-series keyed by channel ID
         ch_ts:  dict[int, list[int]]   = defaultdict(list)
         ch_val: dict[int, list[float]] = defaultdict(list)
         for ts, ch, val in records:
             ch_ts[ch].append(ts)
             ch_val[ch].append(val)
 
-        def make_array(ch: int | None) -> np.ndarray | None:
-            if ch is None or ch not in ch_ts:
+        def arr(ch: int | None) -> np.ndarray | None:
+            if ch is None or ch not in ch_val:
                 return None
             return np.array(ch_val[ch], dtype=np.float64)
 
-        def make_time(ch: int | None) -> np.ndarray | None:
-            if ch is None or ch not in ch_ts:
-                return None
-            ts = np.array(ch_ts[ch], dtype=np.float64) / 1000.0
-            return ts - ts[0]
+        # --- Master time axis from the session-timer channel ---
+        time_ch = assignments.get("time")
+        if time_ch is not None and time_ch in ch_val:
+            t_arr = np.array(ch_val[time_ch], dtype=np.float64)
+        else:
+            # Fall back: derive time from record timestamps
+            # Use the speed channel's timestamps if available
+            speed_ch = assignments.get("speed")
+            ref_ch   = speed_ch if speed_ch is not None else next(iter(ch_ts), None)
+            if ref_ch is None:
+                return
+            ts_ms = np.array(ch_ts[ref_ch], dtype=np.float64)
+            t_arr = (ts_ms - ts_ms[0]) / 1000.0
 
-        # Use latitude's timestamps as the master time axis
-        master_ch = lat_ch if lat_ch is not None else lon_ch
-        if master_ch is None:
+        if len(t_arr) == 0:
             return
-
-        t_arr = make_time(master_ch)
-        if t_arr is None or len(t_arr) == 0:
-            return
-
         session.channels[CH_TIME] = t_arr
 
-        lat_arr = make_array(lat_ch)
-        if lat_arr is not None:
-            session.channels[CH_LAT] = lat_arr
+        # --- GPS (lat/lon inserted later by bare-record scanner if found) ---
 
-        lon_arr = make_array(lon_ch)
-        if lon_arr is not None:
-            session.channels[CH_LON] = lon_arr
+        # --- Speed ---
+        spd = arr(assignments.get("speed"))
+        if spd is not None:
+            session.channels[CH_SPEED] = spd
 
-        spd_arr = make_array(speed_ch)
-        if spd_arr is not None:
-            session.channels[CH_SPEED] = spd_arr
+        # --- Altitude  (feet → metres) ---
+        alt = arr(assignments.get("alt"))
+        if alt is not None:
+            session.channels[CH_HEIGHT] = alt * 0.3048  # ft → m
 
-        alt_arr = make_array(alt_ch)
-        if alt_arr is not None:
-            session.channels[CH_HEIGHT] = alt_arr
+        # --- RPM ---
+        rpm = arr(assignments.get("rpm"))
+        if rpm is not None:
+            session.channels[CH_RPM] = rpm
+
+        # --- Gear ---
+        gear = arr(assignments.get("gear"))
+        if gear is not None:
+            session.channels[CH_GEAR] = gear
+
+        # --- Throttle ---
+        thr = arr(assignments.get("throttle"))
+        if thr is not None:
+            session.channels[CH_THROTTLE] = thr
+
+        # --- Brake (scale 0–66 → 0–100 %) ---
+        brk = arr(assignments.get("brake"))
+        if brk is not None:
+            brk_max = ch_stats.get(assignments["brake"], {}).get("max", 100.0) or 100.0
+            session.channels[CH_BRAKE] = np.clip(brk / brk_max * 100.0, 0, 100)
 
         session.metadata["telemetry"] = "AIM"
         session.metadata["aim_channel_map"] = {
             k: v for k, v in assignments.items() if v is not None
         }
-        session.metadata["aim_channel_stats"] = {
-            str(ch): {k: round(v, 4) if isinstance(v, float) else v
-                      for k, v in s.items()}
-            for ch, s in ch_stats.items()
-        }
+
+    # ------------------------------------------------------------------
+    # GPS from <hGPS> bare records
+    # ------------------------------------------------------------------
+    # AIM stores GPS lat/lon as "bare" records inside <hGPS> tagged blocks.
+    # Bare record format (11 bytes, no "(S" opener):
+    #   uint32 LE  timestamp_ms
+    #   uint16 LE  channel_id
+    #   float32 LE value
+    #   0x29       ")"
+    # The lat/lon channel IDs vary; we auto-detect them by value range.
+
+    @staticmethod
+    def _parse_aim_bare_gps(
+        data: bytes,
+    ) -> dict[int, list[tuple[int, float]]]:
+        """
+        Scan *data* for <hGPS\x00> blocks and extract bare records.
+        Returns {channel_id: [(timestamp_ms, value), ...]}
+        """
+        tag = b'\x3c\x68\x47\x50\x53\x00'   # b'<hGPS\x00'
+        result: dict[int, list] = defaultdict(list)
+        i = 0
+        n = len(data)
+        while i < n - 12:
+            if data[i:i+6] == tag:
+                block_size = struct.unpack_from("<I", data, i + 6)[0]
+                content_start = i + 12   # skip 6-byte tag + 4-byte size + 1 ver + '>'
+                content_end   = min(i + block_size, n)
+                j = content_start
+                while j < content_end - 10:
+                    if data[j] == 0x28 and j + 1 < content_end and data[j + 1] == 0x53:
+                        break  # reached regular (S…) records
+                    if j + 10 < content_end and data[j + 10] == 0x29:
+                        ts  = struct.unpack_from("<I", data, j)[0]
+                        ch  = struct.unpack_from("<H", data, j + 4)[0]
+                        val = struct.unpack_from("<f", data, j + 6)[0]
+                        if not (math.isnan(val) or math.isinf(val)):
+                            result[ch].append((ts, val))
+                        j += 11
+                    else:
+                        j += 1
+                i = content_end
+            else:
+                i += 1
+        return result
+
+    @staticmethod
+    def _inject_bare_gps(
+        bare: dict[int, list[tuple[int, float]]],
+        session: Session,
+    ) -> None:
+        """
+        Try to identify lat/lon channels from bare GPS records and add them
+        to the session if found.
+        """
+        if not bare:
+            return
+
+        lat_ch: int | None = None
+        lon_ch: int | None = None
+
+        for ch, pairs in bare.items():
+            if not pairs:
+                continue
+            vals = [v for _, v in pairs]
+            mn, mx = min(vals), max(vals)
+            mean = sum(vals) / len(vals)
+            ptp  = mx - mn
+
+            # Latitude: values in [−90, 90], ptp < 2 °
+            if 0 < ptp < 2.0 and -90 <= mn and mx <= 90:
+                if lat_ch is None:
+                    lat_ch = ch
+                # Prefer the channel whose mean is more "typical" for a race track
+                elif abs(mean) > abs(sum(v for _, v in bare[lat_ch]) / len(bare[lat_ch])):
+                    lat_ch = ch
+
+            # Longitude: values in [−180, 180], ptp < 5 °, not already lat
+            elif 0 < ptp < 5.0 and -180 <= mn and mx <= 180 and ch != lat_ch:
+                if lon_ch is None:
+                    lon_ch = ch
+
+        if lat_ch is not None:
+            lats = [v for _, v in bare[lat_ch]]
+            session.channels[CH_LAT] = np.array(lats, dtype=np.float64)
+
+        if lon_ch is not None:
+            lons = [v for _, v in bare[lon_ch]]
+            session.channels[CH_LON] = np.array(lons, dtype=np.float64)
 
     # ------------------------------------------------------------------
     # GoPro GPMD fallback

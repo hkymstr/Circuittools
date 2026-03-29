@@ -333,6 +333,77 @@ def analyze(path):
                                 print(f"    {ch:>5}  {s['n']:>7}  {s['min']:>12.4f}  {s['max']:>12.4f}"
                                       f"  {s['mean']:>12.4f}  {s['ptp']:>10.4f}")
 
+                        # Scan for GPS bare records inside <hGPS> blocks and
+                        # scan all bytes for float32 values in lat/lon range.
+                        print(f"\n    ── GPS coordinate scan ──")
+                        hgps_tag = b'\x3c\x68\x47\x50\x53\x00'  # <hGPS\x00
+                        lat_hits = []
+                        lon_hits = []
+                        bare_recs = []
+                        i = 0
+                        while i < len(all_data) - 12:
+                            # Find <hGPS\x00 marker
+                            if all_data[i:i+6] == hgps_tag:
+                                block_size = struct.unpack_from('<I', all_data, i+6)[0]
+                                # Content starts 12 bytes in (tag + 4-byte size + 1 ver + '>')
+                                content_start = i + 12
+                                content_end   = min(i + block_size, len(all_data))
+                                j = content_start
+                                while j < content_end - 10:
+                                    if all_data[j] == 0x28 and all_data[j+1] == 0x53:
+                                        break  # hit regular (S...) record
+                                    if j + 10 < content_end and all_data[j+10] == 0x29:
+                                        ts  = struct.unpack_from('<I', all_data, j)[0]
+                                        ch  = struct.unpack_from('<H', all_data, j+4)[0]
+                                        val = struct.unpack_from('<f', all_data, j+6)[0]
+                                        import math as _m
+                                        if not (_m.isnan(val) or _m.isinf(val)):
+                                            bare_recs.append((ts, ch, round(val, 6)))
+                                        j += 11
+                                    else:
+                                        j += 1
+                                i = content_end
+                            else:
+                                # Scan every 4-byte aligned position for lat/lon floats
+                                if i % 4 == 0 and i + 4 <= len(all_data):
+                                    import math as _m
+                                    v = struct.unpack_from('<f', all_data, i)[0]
+                                    if not (_m.isnan(v) or _m.isinf(v)):
+                                        if 30.0 <= v <= 75.0:
+                                            lat_hits.append((i, round(v, 5)))
+                                        elif -30.0 <= v <= 50.0 and abs(v) > 0.01:
+                                            lon_hits.append((i, round(v, 5)))
+                                i += 1
+
+                        if bare_recs:
+                            from collections import Counter as _C
+                            ch_counts = _C(r[1] for r in bare_recs)
+                            print(f"    Bare records in <hGPS> blocks: {len(bare_recs)}")
+                            print(f"    Bare record channels: {dict(ch_counts)}")
+                            from collections import defaultdict as _dd
+                            bv = _dd(list)
+                            for ts, ch, val in bare_recs:
+                                bv[ch].append(val)
+                            for ch in sorted(bv):
+                                vals = bv[ch]
+                                print(f"      ch{ch:>3}: n={len(vals):>5}  "
+                                      f"min={min(vals):.5f}  max={max(vals):.5f}  mean={sum(vals)/len(vals):.5f}")
+                        else:
+                            print("    No bare records found in <hGPS> blocks.")
+
+                        # Report unique lat/lon float hits (deduplicated by value)
+                        from collections import Counter as _C2
+                        lat_uniq = sorted(set(v for _, v in lat_hits))
+                        lon_uniq = sorted(set(v for _, v in lon_hits))
+                        print(f"    Float32 values in lat range [30,75]: {len(lat_hits)} hits, "
+                              f"{len(lat_uniq)} unique values")
+                        if lat_uniq:
+                            print(f"      Sample values: {lat_uniq[:10]}")
+                        print(f"    Float32 values in lon range [-30,50]: {len(lon_hits)} hits, "
+                              f"{len(lon_uniq)} unique values")
+                        if lon_uniq:
+                            print(f"      Sample values: {lon_uniq[:10]}")
+
             pos += size
 
         # Dump udta / user metadata text
