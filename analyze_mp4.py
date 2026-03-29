@@ -150,6 +150,115 @@ def hexdump(data, max_bytes=256):
         lines.append(f"  {i:04x}  {hex_part:<48s}  {ascii_part}")
     return "\n".join(lines)
 
+def read_all_stco(fp, trak_start, trak_end):
+    """Read ALL chunk offsets (not capped at 1000)."""
+    result = find_box(fp, "stco", trak_start, trak_end)
+    if not result:
+        return []
+    pos, size, hdr = result
+    fp.seek(pos + hdr + 4)
+    count = struct.unpack(">I", fp.read(4))[0]
+    return [struct.unpack(">I", fp.read(4))[0] for _ in range(count)]
+
+
+def read_all_stsz(fp, trak_start, trak_end):
+    """Returns (default_size, [sample_sizes])."""
+    result = find_box(fp, "stsz", trak_start, trak_end)
+    if not result:
+        return 0, []
+    pos, size, hdr = result
+    fp.seek(pos + hdr + 4)
+    default_size = struct.unpack(">I", fp.read(4))[0]
+    count        = struct.unpack(">I", fp.read(4))[0]
+    if default_size > 0:
+        return default_size, []
+    sizes = [struct.unpack(">I", fp.read(4))[0] for _ in range(count)]
+    return 0, sizes
+
+
+def read_stsc_entries(fp, trak_start, trak_end):
+    """Returns list of (first_chunk_1based, samples_per_chunk)."""
+    result = find_box(fp, "stsc", trak_start, trak_end)
+    if not result:
+        return []
+    pos, size, hdr = result
+    fp.seek(pos + hdr + 4)
+    count = struct.unpack(">I", fp.read(4))[0]
+    entries = []
+    for _ in range(count):
+        fc  = struct.unpack(">I", fp.read(4))[0]
+        spc = struct.unpack(">I", fp.read(4))[0]
+        _   = fp.read(4)  # sample_description_index
+        entries.append((fc, spc))
+    return entries
+
+
+def read_all_samples(fp, trak_start, trak_end):
+    """Read and concatenate all raw sample bytes for a track."""
+    import math as _math
+    chunk_offsets = read_all_stco(fp, trak_start, trak_end)
+    default_size, sample_sizes = read_all_stsz(fp, trak_start, trak_end)
+    stsc = read_stsc_entries(fp, trak_start, trak_end)
+    if not stsc:
+        stsc = [(1, max(1, len(sample_sizes) // max(len(chunk_offsets), 1)))]
+
+    sample_count = len(sample_sizes) if default_size == 0 else sum(1 for _ in chunk_offsets)
+    parts = []
+    sample_idx = 0
+    for chunk_idx, chunk_off in enumerate(chunk_offsets):
+        chunk_num = chunk_idx + 1
+        spc = 1
+        for fc, s in reversed(stsc):
+            if chunk_num >= fc:
+                spc = s
+                break
+        offset = chunk_off
+        for _ in range(spc):
+            if sample_idx >= sample_count:
+                break
+            sz = default_size if default_size > 0 else (sample_sizes[sample_idx] if sample_idx < len(sample_sizes) else 0)
+            if sz > 0:
+                fp.seek(offset)
+                parts.append(fp.read(sz))
+            offset += sz
+            sample_idx += 1
+    return b"".join(parts)
+
+
+def parse_aim_records(data):
+    """Scan bytes for AIM (S...) records: 28 53 uint32 uint16 float32 29."""
+    import math as _math
+    records = []
+    i = 0
+    n = len(data)
+    while i < n - 12:
+        if data[i] == 0x28 and data[i+1] == 0x53 and data[i+12] == 0x29:
+            ts  = struct.unpack_from("<I", data, i+2)[0]
+            ch  = struct.unpack_from("<H", data, i+6)[0]
+            val = struct.unpack_from("<f", data, i+8)[0]
+            if not (_math.isnan(val) or _math.isinf(val)):
+                records.append((ts, ch, val))
+            i += 13
+        else:
+            i += 1
+    return records
+
+
+def aim_channel_stats(records):
+    """Return dict channel_id -> {min, max, mean, ptp, n}."""
+    from collections import defaultdict as _dd
+    ch_vals = _dd(list)
+    for ts, ch, val in records:
+        ch_vals[ch].append(val)
+    stats = {}
+    for ch, vals in ch_vals.items():
+        mn, mx = min(vals), max(vals)
+        stats[ch] = {"min": mn, "max": mx,
+                     "mean": sum(vals)/len(vals),
+                     "ptp": mx - mn, "n": len(vals)}
+    return stats
+
+
 def analyze(path):
     print(f"\n{'='*60}")
     print(f"Analyzing: {os.path.basename(path)}")
@@ -196,7 +305,7 @@ def analyze(path):
                 print(f"    Default size : {default_size}")
                 print(f"    Chunk offsets: {offsets[:5]}{'...' if len(offsets) > 5 else ''}")
 
-                # For non-video/audio tracks, dump raw bytes
+                # For non-video/audio tracks, dump raw bytes AND parse AIM records
                 if handler not in ("vide", "soun") and offsets:
                     print(f"\n    ── Raw bytes of first chunk (offset {offsets[0]}) ──")
                     fp.seek(offsets[0])
@@ -207,6 +316,22 @@ def analyze(path):
                         fp.seek(offsets[1])
                         raw2 = fp.read(256)
                         print(hexdump(raw2))
+
+                    if "aim" in name.lower():
+                        print(f"\n    ── AIM channel statistics (reading all {sample_count} samples) ──")
+                        print("    (This may take a few seconds...)")
+                        all_data = read_all_samples(fp, trak_start, trak_end)
+                        print(f"    Total bytes read : {len(all_data):,}")
+                        records = parse_aim_records(all_data)
+                        print(f"    (S…) records     : {len(records):,}")
+                        if records:
+                            stats = aim_channel_stats(records)
+                            print(f"\n    {'Ch':>5}  {'N':>7}  {'Min':>12}  {'Max':>12}  {'Mean':>12}  {'PTP':>10}")
+                            print("    " + "-" * 65)
+                            for ch in sorted(stats):
+                                s = stats[ch]
+                                print(f"    {ch:>5}  {s['n']:>7}  {s['min']:>12.4f}  {s['max']:>12.4f}"
+                                      f"  {s['mean']:>12.4f}  {s['ptp']:>10.4f}")
 
             pos += size
 
