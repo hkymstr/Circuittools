@@ -166,6 +166,7 @@ class ChannelPanel(QWidget):
         self._plots: dict[str, _ChannelPlot] = {}
         self._visible_channels: set[str] = set(DEFAULT_CHANNEL_ORDER)
         self._link_x_axis: pg.ViewBox | None = None
+        self._active_lap = None   # Lap | None — which lap is currently displayed
 
         self._build_ui()
         playback.session_loaded.connect(self._on_session_loaded)
@@ -228,6 +229,7 @@ class ChannelPanel(QWidget):
 
     def _on_session_loaded(self, session: Session) -> None:
         self._session = session
+        self._active_lap = None
         self._rebuild_plots()
 
     def _rebuild_plots(self) -> None:
@@ -295,7 +297,11 @@ class ChannelPanel(QWidget):
         if not lap_numbers or len(lap_numbers) < 1:
             return
 
-        for i, lap_num in enumerate(lap_numbers[:4]):
+        overlay_idx = 0
+        for lap_num in lap_numbers[:4]:
+            # Skip the active lap — it's already shown as the main data
+            if self._active_lap is not None and self._active_lap.number == lap_num:
+                continue
             lap = next(
                 (l for l in self._session.laps if l.number == lap_num), None
             )
@@ -310,7 +316,8 @@ class ChannelPanel(QWidget):
             for ch, plot in self._plots.items():
                 data = channels.get(ch)
                 if data is not None:
-                    plot.set_compare_data(i, t_relative, data)
+                    plot.set_compare_data(overlay_idx, t_relative, data)
+            overlay_idx += 1
 
         # Add Delta-T plot when exactly two laps are compared
         if len(lap_numbers) >= 2 and self._session.best_lap:
@@ -362,21 +369,45 @@ class ChannelPanel(QWidget):
         self._plots["__delta_t__"] = plot
 
     def _on_time_changed(self, t: float) -> None:
+        # When a lap is active, express cursor in lap-relative seconds (0 = lap start)
+        if self._active_lap is not None:
+            cursor_t = t - self._active_lap.start_time
+        else:
+            cursor_t = t
         for plot in self._plots.values():
-            plot.set_cursor(t)
+            plot.set_cursor(cursor_t)
 
     def _on_lap_selected(self, lap_number: int) -> None:
         if self._session is None:
             return
         if lap_number == 0:
-            t = self._session.channels.get(CH_TIME)
-            if t is not None:
-                for plot in self._plots.values():
-                    plot.set_x_range(float(t[0]), float(t[-1]))
+            self._active_lap = None
+            self._load_channel_data(self._session.channels.get(CH_TIME),
+                                    self._session.channels)
         else:
             lap = next(
                 (l for l in self._session.laps if l.number == lap_number), None
             )
-            if lap:
-                for plot in self._plots.values():
-                    plot.set_x_range(lap.start_time, lap.end_time)
+            if lap is None:
+                return
+            self._active_lap = lap
+            ch = self._session.lap_channels(lap)
+            t_abs = ch.get(CH_TIME)
+            if t_abs is None or len(t_abs) == 0:
+                return
+            t_rel = t_abs - t_abs[0]   # relative time: 0 → lap_time
+            self._load_channel_data(t_rel, ch)
+
+    def _load_channel_data(self, t, channels: dict) -> None:
+        """Push new (t, data) arrays into every existing plot."""
+        if t is None or len(t) == 0:
+            return
+        for ch, plot in self._plots.items():
+            if ch == "__delta_t__":
+                continue
+            data = channels.get(ch)
+            if data is not None and len(data) == len(t):
+                plot.set_data(t, data)
+        t0, t1 = float(t[0]), float(t[-1])
+        for plot in self._plots.values():
+            plot.set_x_range(t0, t1)
