@@ -344,6 +344,7 @@ class MainWindow(QMainWindow):
         self._rate_combo.currentIndexChanged.connect(self._on_rate_changed)
 
         self._lap_panel.laps_compare_changed.connect(self._on_compare_changed)
+        self._lap_panel.lap_selected.connect(self._playback.select_lap)
 
         self._track_map_panel.finish_line_set.connect(self._on_finish_line_set)
 
@@ -395,11 +396,12 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Load Error", str(exc))
             return
 
-        # Auto-detect laps
-        detect_laps(session)
-
         self._session = session
         self._playback.load_session(session)
+
+        # Auto-detect laps after the session is published so UI can respond
+        detect_laps(session)
+        self._playback.notify_laps_updated()
         self.setWindowTitle(
             f"{self.APP_TITLE} — {os.path.basename(path)}"
         )

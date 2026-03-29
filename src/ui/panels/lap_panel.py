@@ -131,23 +131,49 @@ class LapPanel(QWidget):
         self._refresh_table()
 
     def _refresh_table(self) -> None:
+        import numpy as np
+        from ...data.session import CH_SPEED
         session = self._session
         self._table.setRowCount(0)
         if session is None:
             return
 
         laps = session.laps
+        best = session.best_lap
+        mono = QFont("Consolas", 10)
+
+        # Row 0 = Full Session (lap number 0)
+        total_rows = 1 + len(laps)
+        self._table.setRowCount(total_rows)
+
+        # -- Full Session row --
+        dur = session.duration
+        spd_all = session.channels.get(CH_SPEED)
+        v_max_all = float(np.nanmax(spd_all)) if spd_all is not None and len(spd_all) else 0.0
+        v_avg_all = float(np.nanmean(spd_all)) if spd_all is not None and len(spd_all) else 0.0
+        m, s = int(dur // 60), dur % 60
+        dur_str = f"{m}:{s:06.3f}"
+        for col, (text, align) in enumerate([
+            ("All", Qt.AlignmentFlag.AlignCenter),
+            (dur_str, Qt.AlignmentFlag.AlignCenter),
+            ("—", Qt.AlignmentFlag.AlignCenter),
+            (f"{v_max_all:.1f}", Qt.AlignmentFlag.AlignCenter),
+            (f"{v_avg_all:.1f}", Qt.AlignmentFlag.AlignCenter),
+        ]):
+            item = QTableWidgetItem(text)
+            item.setTextAlignment(align)
+            item.setFont(mono)
+            item.setData(Qt.ItemDataRole.UserRole, 0)   # lap 0 = full session
+            item.setForeground(QColor(TEXT_SECONDARY))
+            self._table.setItem(0, col, item)
+        self._table.setRowHeight(0, 24)
+
         if not laps:
             self._summary.setText("No laps detected — click Auto Detect")
             return
 
-        best = session.best_lap
-        mono = QFont("Consolas", 10)
-
-        self._table.setRowCount(len(laps))
-        for row, lap in enumerate(laps):
-            import numpy as np
-            from ...data.session import CH_SPEED
+        # -- Individual lap rows --
+        for row, lap in enumerate(laps, start=1):
             channels = session.lap_channels(lap)
             spd = channels.get(CH_SPEED)
             v_max = float(np.nanmax(spd)) if spd is not None and len(spd) else 0.0
@@ -177,10 +203,7 @@ class LapPanel(QWidget):
                     item.setForeground(QColor(ACCENT_ORANGE))
 
                 self._table.setItem(row, col, item)
-
-        self._table.setRowHeight(0, 26)
-        for r in range(len(laps)):
-            self._table.setRowHeight(r, 24)
+            self._table.setRowHeight(row, 24)
 
         self._summary.setText(
             f"{len(laps)} laps  |  "
@@ -193,18 +216,25 @@ class LapPanel(QWidget):
     # ------------------------------------------------------------------
 
     def _on_time_changed(self, t: float) -> None:
-        """Highlight the row for the currently active lap."""
+        """Bold the row for the lap that contains the current playhead."""
         if self._session is None:
             return
+        active_lap = next(
+            (l for l in self._session.laps if l.start_time <= t < l.end_time),
+            None,
+        )
         for row in range(self._table.rowCount()):
-            item = self._table.item(row, 0)
-            if item is None:
+            item0 = self._table.item(row, 0)
+            if item0 is None:
                 continue
-            lap_num = item.data(Qt.ItemDataRole.UserRole)
-            lap = next((l for l in self._session.laps if l.number == lap_num), None)
-            if lap and lap.start_time <= t < lap.end_time:
-                self._table.scrollToItem(item)
-                break
+            lap_num = item0.data(Qt.ItemDataRole.UserRole)
+            in_this_row = (active_lap is not None and active_lap.number == lap_num)
+            f = QFont("Consolas", 10)
+            f.setBold(in_this_row)
+            for col in range(self._table.columnCount()):
+                cell = self._table.item(row, col)
+                if cell:
+                    cell.setFont(f)
 
     def _on_selection_changed(self) -> None:
         selected_rows = {i.row() for i in self._table.selectedIndexes()}
