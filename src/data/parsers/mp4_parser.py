@@ -183,9 +183,9 @@ class Mp4Parser(BaseParser):
 
         self._build_session(records, assignments, ch_stats, session)
 
-        # Try to recover GPS lat/lon from bare records in <hGPS> blocks
-        bare = self._parse_aim_bare_gps(raw_data)
-        self._inject_bare_gps(bare, session)
+        # Recover GPS lat/lon from <hGPS> blocks (int32 × 1e-7 at fixed offsets)
+        lats, lons = self._parse_aim_gps_blocks(raw_data)
+        self._inject_gps_blocks(lats, lons, session)
 
         return True
 
@@ -439,7 +439,7 @@ class Mp4Parser(BaseParser):
         alt_ch = _pick(alt_cands, lambda c: min(c, key=lambda x: x[1]["ptp"])[0])
 
         # GPS lat/lon: NOT present in (S…) records for this firmware.
-        # They appear in <hGPS> bare records; handled by _parse_aim_bare_gps().
+        # They are stored as int32 × 1e-7 in <hGPS> blocks; handled by _parse_aim_gps_blocks().
         lat_ch: int | None = None
         lon_ch: int | None = None
 
@@ -538,93 +538,55 @@ class Mp4Parser(BaseParser):
         }
 
     # ------------------------------------------------------------------
-    # GPS from <hGPS> bare records
+    # GPS from <hGPS> blocks (int32 × 1e-7 at fixed offsets)
     # ------------------------------------------------------------------
-    # AIM stores GPS lat/lon as "bare" records inside <hGPS> tagged blocks.
-    # Bare record format (11 bytes, no "(S" opener):
-    #   uint32 LE  timestamp_ms
-    #   uint16 LE  channel_id
-    #   float32 LE value
-    #   0x29       ")"
-    # The lat/lon channel IDs vary; we auto-detect them by value range.
+    # AIM stores GPS lat/lon as int32 × 1e-7 degrees at FIXED byte offsets
+    # inside <hGPS\x00 SIZE VER> block content:
+    #   content[4:8]   = int32 LE latitude  × 1e7
+    #   content[12:16] = int32 LE longitude × 1e7
+    # Verified from SCHD1246.MP4:
+    #   content[4:8]  = 0x22C14220 = 582,968,352 → 58.2968°N
+    #   content[12:16]= 0x0D03096A = 218,499,434 → 21.8499°E
+    # Block header: tag(6) + size_LE(4) + version(1) + '>'(1) = 12 bytes
 
     @staticmethod
-    def _parse_aim_bare_gps(
-        data: bytes,
-    ) -> dict[int, list[tuple[int, float]]]:
+    def _parse_aim_gps_blocks(data: bytes) -> tuple[list[float], list[float]]:
         """
-        Scan *data* for <hGPS\x00> blocks and extract bare records.
-        Returns {channel_id: [(timestamp_ms, value), ...]}
+        Scan *data* for <hGPS\\x00> blocks and extract lat/lon as int32 × 1e-7.
+        Returns (lats, lons) lists of float degrees.
         """
-        tag = b'\x3c\x68\x47\x50\x53\x00'   # b'<hGPS\x00'
-        result: dict[int, list] = defaultdict(list)
+        tag = b'\x3c\x68\x47\x50\x53\x00'  # b'<hGPS\x00'
+        lats: list[float] = []
+        lons: list[float] = []
         i = 0
         n = len(data)
-        while i < n - 12:
+        while i < n - 20:
             if data[i:i+6] == tag:
                 block_size = struct.unpack_from("<I", data, i + 6)[0]
-                content_start = i + 12   # skip 6-byte tag + 4-byte size + 1 ver + '>'
-                content_end   = min(i + block_size, n)
-                j = content_start
-                while j < content_end - 10:
-                    if data[j] == 0x28 and j + 1 < content_end and data[j + 1] == 0x53:
-                        break  # reached regular (S…) records
-                    if j + 10 < content_end and data[j + 10] == 0x29:
-                        ts  = struct.unpack_from("<I", data, j)[0]
-                        ch  = struct.unpack_from("<H", data, j + 4)[0]
-                        val = struct.unpack_from("<f", data, j + 6)[0]
-                        if not (math.isnan(val) or math.isinf(val)):
-                            result[ch].append((ts, val))
-                        j += 11
-                    else:
-                        j += 1
-                i = content_end
+                content_start = i + 12  # 6-byte tag + 4-byte size + 1 ver + '>'
+                content_end = min(i + block_size, n)
+                if content_end - content_start >= 16:
+                    lat_raw = struct.unpack_from("<i", data, content_start + 4)[0]
+                    lon_raw = struct.unpack_from("<i", data, content_start + 12)[0]
+                    lat = lat_raw / 1e7
+                    lon = lon_raw / 1e7
+                    if -90 <= lat <= 90 and -180 <= lon <= 180 and (lat != 0.0 or lon != 0.0):
+                        lats.append(lat)
+                        lons.append(lon)
+                i = max(i + 1, content_end)
             else:
                 i += 1
-        return result
+        return lats, lons
 
     @staticmethod
-    def _inject_bare_gps(
-        bare: dict[int, list[tuple[int, float]]],
+    def _inject_gps_blocks(
+        lats: list[float],
+        lons: list[float],
         session: Session,
     ) -> None:
-        """
-        Try to identify lat/lon channels from bare GPS records and add them
-        to the session if found.
-        """
-        if not bare:
-            return
-
-        lat_ch: int | None = None
-        lon_ch: int | None = None
-
-        for ch, pairs in bare.items():
-            if not pairs:
-                continue
-            vals = [v for _, v in pairs]
-            mn, mx = min(vals), max(vals)
-            mean = sum(vals) / len(vals)
-            ptp  = mx - mn
-
-            # Latitude: values in [−90, 90], ptp < 2 °
-            if 0 < ptp < 2.0 and -90 <= mn and mx <= 90:
-                if lat_ch is None:
-                    lat_ch = ch
-                # Prefer the channel whose mean is more "typical" for a race track
-                elif abs(mean) > abs(sum(v for _, v in bare[lat_ch]) / len(bare[lat_ch])):
-                    lat_ch = ch
-
-            # Longitude: values in [−180, 180], ptp < 5 °, not already lat
-            elif 0 < ptp < 5.0 and -180 <= mn and mx <= 180 and ch != lat_ch:
-                if lon_ch is None:
-                    lon_ch = ch
-
-        if lat_ch is not None:
-            lats = [v for _, v in bare[lat_ch]]
+        """Add GPS lat/lon arrays to the session if both lists are non-empty."""
+        if lats and lons:
             session.channels[CH_LAT] = np.array(lats, dtype=np.float64)
-
-        if lon_ch is not None:
-            lons = [v for _, v in bare[lon_ch]]
             session.channels[CH_LON] = np.array(lons, dtype=np.float64)
 
     # ------------------------------------------------------------------
